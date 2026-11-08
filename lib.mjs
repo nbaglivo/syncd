@@ -163,3 +163,22 @@ export async function publish ({ folder, dir, drive, settleMs, now = Date.now() 
   const { add, change, remove } = m.count
   return { count: { add, change, remove }, deferred: deferred() }
 }
+
+export function createStatus (file, { throttleMs = 30000, now = Date.now } = {}) {
+  let lastWrite = -Infinity
+  let writing = Promise.resolve()
+  const write = (syncing) => {
+    const t = now()
+    lastWrite = t
+    writing = writing
+      .then(() => writeAtomic(file, JSON.stringify({ syncing, at: new Date(t).toISOString() }) + '\n'))
+      .catch((err) => log('status file:', err.message))
+    return writing
+  }
+  if (!file) return { start: async () => {}, progress: async () => {}, stop: async () => {} }
+  return {
+    start: () => write(true),
+    progress: () => (now() - lastWrite >= throttleMs ? write(true) : writing),
+    stop: () => write(false)
+  }
+}
