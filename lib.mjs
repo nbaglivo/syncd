@@ -1,5 +1,6 @@
 import Localdrive from 'localdrive'
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 export function readConfig (env) {
@@ -130,4 +131,35 @@ async function writeAtomic (file, text) {
   const tmp = `${file}.${process.pid}.tmp`
   await writeFile(tmp, text)
   await rename(tmp, file)
+}
+
+export function settledFilter (dir, settleMs, now) {
+  const deferred = new Set()
+  const filter = (key) => {
+    if (!settleMs) return true
+    let st
+    try {
+      st = statSync(join(dir, key))
+    } catch {
+      return true
+    }
+    if (!st.isFile()) return true
+    if (st.mtimeMs > now - settleMs) {
+      deferred.add(key)
+      return false
+    }
+    return true
+  }
+  return { filter, deferred: () => deferred.size }
+}
+
+export async function publish ({ folder, dir, drive, settleMs, now = Date.now() }) {
+  await drive.ready()
+  const before = drive.version
+  const { filter, deferred } = settledFilter(dir, settleMs, now)
+  const m = folder.mirror(drive, { filter })
+  await m.done()
+  await reclaim(drive, before)
+  const { add, change, remove } = m.count
+  return { count: { add, change, remove }, deferred: deferred() }
 }
