@@ -75,42 +75,71 @@ async function countFiles (folder) {
   return n
 }
 
-export async function pull ({ drive, folder, fromVersion, wipeGuard, onDownload }) {
+// A pull mirrors one snapshot. If the publisher has moved on and cleared the
+// blocks that snapshot still needs, nobody can serve them and reads wait
+// forever: after `stallMs` without a downloaded block while the drive is ahead
+// of the snapshot, give up with code STALLED (the caller restarts the pull).
+export async function pull ({ drive, version: at, folder, fromVersion, wipeGuard, onDownload, stallMs = 60000 }) {
   await drive.ready()
-  const snap = drive.checkout(drive.version)
+  const snap = drive.checkout(at ?? drive.version)
   await snap.ready()
   const version = snap.version
   const blobs = await drive.getBlobs()
-  const ondownload = () => onDownload?.()
-  if (onDownload && blobs) blobs.core.on('download', ondownload)
-  try {
-    let opts = {}
-    if (fromVersion !== null) {
-      const keys = []
-      for (const key of await changedKeys(snap, fromVersion)) {
-        if ((await snap.entry(key)) || (await folder.entry(key))) keys.push(key)
-      }
-      if (keys.length === 0) return { version, count: { add: 0, change: 0, remove: 0 }, refused: false }
-      opts = { entries: keys }
-    }
-    if (wipeGuard) {
-      const files = await countFiles(folder)
-      const dry = snap.mirror(folder, { ...opts, dryRun: true })
-      await dry.done()
-      if (files > 0 && files - dry.count.remove + dry.count.add === 0) {
-        log(`pull refused: would leave ${folder.root} empty`)
-        return { version, count: { add: 0, change: 0, remove: 0 }, refused: true }
-      }
-    }
-    const m = snap.mirror(folder, opts)
-    await m.done()
-    await reclaim(snap, fromVersion ?? 0)
-    const { add, change, remove } = m.count
-    return { version, count: { add, change, remove }, refused: false }
-  } finally {
-    if (onDownload && blobs) blobs.core.off('download', ondownload)
-    await snap.close()
+  let last = Date.now()
+  const ondownload = () => {
+    last = Date.now()
+    onDownload?.()
   }
+  drive.core.on('download', ondownload)
+  blobs?.core.on('download', ondownload)
+  let timer
+  const stalled = new Promise((resolve, reject) => {
+    timer = setInterval(() => {
+      if (drive.version > version && Date.now() - last > stallMs) {
+        const err = new Error(`pull stalled: no data for ${Math.round(stallMs / 1000)} s and the drive moved past version ${version}`)
+        err.code = 'STALLED'
+        reject(err)
+      }
+    }, Math.max(10, Math.min(1000, stallMs / 4)))
+  })
+  let ok = false
+  try {
+    const r = await Promise.race([mirrorSnapshot({ snap, version, folder, fromVersion, wipeGuard }), stalled])
+    ok = true
+    return r
+  } finally {
+    clearInterval(timer)
+    drive.core.off('download', ondownload)
+    blobs?.core.off('download', ondownload)
+    if (ok) await snap.close()
+    else snap.close().catch(() => {})
+  }
+}
+
+async function mirrorSnapshot ({ snap, version, folder, fromVersion, wipeGuard }) {
+  let opts = {}
+  if (fromVersion !== null) {
+    const keys = []
+    for (const key of await changedKeys(snap, fromVersion)) {
+      if ((await snap.entry(key)) || (await folder.entry(key))) keys.push(key)
+    }
+    if (keys.length === 0) return { version, count: { add: 0, change: 0, remove: 0 }, refused: false }
+    opts = { entries: keys }
+  }
+  if (wipeGuard) {
+    const files = await countFiles(folder)
+    const dry = snap.mirror(folder, { ...opts, dryRun: true })
+    await dry.done()
+    if (files > 0 && files - dry.count.remove + dry.count.add === 0) {
+      log(`pull refused: would leave ${folder.root} empty`)
+      return { version, count: { add: 0, change: 0, remove: 0 }, refused: true }
+    }
+  }
+  const m = snap.mirror(folder, opts)
+  await m.done()
+  await reclaim(snap, fromVersion ?? 0)
+  const { add, change, remove } = m.count
+  return { version, count: { add, change, remove }, refused: false }
 }
 
 export async function loadPulled (storage, key) {
@@ -133,10 +162,15 @@ async function writeAtomic (file, text) {
   await rename(tmp, file)
 }
 
-export function settledFilter (dir, settleMs, now) {
+// Decides which files a publish looks at. Unsettled files (modified less than
+// settleMs ago) wait. Files whose size and mtime match what the last publish
+// saw (`seen`) are skipped: comparing them would read the whole file and its
+// copy in the drive, i.e. the whole library on every change.
+export function settledFilter (dir, settleMs, now, seen = null) {
   const deferred = new Set()
+  const skipped = new Set()
+  const pending = new Map()
   const filter = (key) => {
-    if (!settleMs) return true
     let st
     try {
       st = statSync(join(dir, key))
@@ -144,24 +178,38 @@ export function settledFilter (dir, settleMs, now) {
       return true
     }
     if (!st.isFile()) return true
-    if (st.mtimeMs > now - settleMs) {
+    if (settleMs && st.mtimeMs > now - settleMs) {
       deferred.add(key)
       return false
     }
+    const sig = `${st.size}:${st.mtimeMs}`
+    if (seen && seen.get(key) === sig) {
+      skipped.add(key)
+      return false
+    }
+    pending.set(key, sig)
     return true
   }
-  return { filter, deferred: () => deferred.size }
+  return { filter, deferred: () => deferred.size, skipped: () => skipped.size, pending }
 }
 
-export async function publish ({ folder, dir, drive, settleMs, now = Date.now() }) {
+export async function publish ({ folder, dir, drive, settleMs, now = Date.now(), seen = null }) {
   await drive.ready()
   const before = drive.version
-  const { filter, deferred } = settledFilter(dir, settleMs, now)
+  const { filter, deferred, skipped, pending } = settledFilter(dir, settleMs, now, seen)
   const m = folder.mirror(drive, { filter })
-  await m.done()
-  await reclaim(drive, before)
+  const removed = []
+  try {
+    for await (const op of m) if (op.op === 'remove') removed.push(op.key)
+  } finally {
+    await reclaim(drive, before)
+  }
+  if (seen) {
+    for (const [key, sig] of pending) seen.set(key, sig)
+    for (const key of removed) seen.delete(key)
+  }
   const { add, change, remove } = m.count
-  return { count: { add, change, remove }, deferred: deferred() }
+  return { count: { add, change, remove }, deferred: deferred(), skipped: skipped() }
 }
 
 export function createStatus (file, { throttleMs = 30000, now = Date.now } = {}) {
@@ -181,4 +229,16 @@ export function createStatus (file, { throttleMs = 30000, now = Date.now } = {})
     progress: () => (now() - lastWrite >= throttleMs ? write(true) : writing),
     stop: () => write(false)
   }
+}
+
+// Pull now and whenever the drive advances. The watcher is created first: it
+// only reports versions newer than when it was opened, so one opened after a
+// long first pull would miss what arrived during it.
+export function follow (drive, run) {
+  const watcher = drive.watch('/')
+  const done = (async () => {
+    await run()
+    for await (const _ of watcher) await run()
+  })()
+  return { done, stop: () => watcher.destroy() }
 }

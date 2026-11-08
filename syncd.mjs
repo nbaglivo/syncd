@@ -6,7 +6,7 @@ import b4a from 'b4a'
 import fs from 'fs'
 import {
   readConfig, log, openFolder, removeStaleTmp, publish, pull,
-  loadPulled, savePulled, createStatus
+  loadPulled, savePulled, createStatus, follow
 } from './lib.mjs'
 
 // ---- config (set via env, see README) ----
@@ -56,9 +56,10 @@ if (config.push) {
 
 // push: local folder -> my drive (files still being written wait SETTLE_MS)
 let settleTimer = null
+const seen = new Map()   // size+mtime of what was published: unchanged files aren't re-read
 const push = debounce(async () => {
   try {
-    const r = await publish({ folder, dir: FOLDER, drive: mine, settleMs: config.settleMs })
+    const r = await publish({ folder, dir: FOLDER, drive: mine, settleMs: config.settleMs, seen })
     if (changed(r.count)) log(`push +${r.count.add} ~${r.count.change} -${r.count.remove}`)
     if (r.deferred) {
       log('push deferred', r.deferred, 'unsettled files')
@@ -98,16 +99,17 @@ if (PEER_KEY) {
       if (changed(r.count)) log(`pull +${r.count.add} ~${r.count.change} -${r.count.remove}`)
     } catch (err) {
       log('pull failed:', err.message)
+      // Hung reads can't be cancelled: restart clean (systemd/launchd bring us
+      // back, already-downloaded blocks are kept).
+      if (err.code === 'STALLED') process.exit(1)
     } finally {
       await status.stop()
     }
   })
 
   await theirs.update()
-  await runPull()
-  // keep pulling forever whenever their drive advances
-  ;(async () => { for await (const _ of theirs.watch('/')) await runPull() })()
-    .catch(err => log('watch failed:', err.message))
+  // pull now, then whenever their drive advances (including during this pull)
+  follow(theirs, runPull).done.catch(err => log('watch failed:', err.message))
 } else {
   await swarm.flush()
 }
