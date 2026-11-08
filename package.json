@@ -2,9 +2,9 @@
   "name": "syncd",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "syncd.mjs",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test \"test/*.test.mjs\""
   },
   "keywords": [],
   "author": "",

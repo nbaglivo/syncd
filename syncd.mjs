@@ -5,11 +5,13 @@ import Localdrive from 'localdrive'
 import debounce from 'debounceify'
 import b4a from 'b4a'
 import fs from 'fs'
+import { readConfig, log } from './lib.mjs'
 
 // ---- config (set via env) ----
-const FOLDER   = process.env.FOLDER   || './shared'
-const STORAGE  = process.env.STORAGE  || './data/syncd'
-const PEER_KEY = process.env.PEER_KEY || ''      // the OTHER machine's drive key (hex)
+const config   = readConfig(process.env)
+const FOLDER   = config.folder
+const STORAGE  = config.storage
+const PEER_KEY = config.peerKey      // the OTHER machine's drive key (hex)
 
 const store  = new Corestore(STORAGE)
 const folder = new Localdrive(FOLDER)
@@ -61,5 +63,4 @@ console.log('MY DRIVE KEY (paste into the other machine\'s PEER_KEY):')
 console.log(mine.key.toString('hex'))
 
 function changed (m) { return m.count.add || m.count.remove || m.count.change }
-function log (...a) { console.log(new Date().toISOString(), ...a) }
 
