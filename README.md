@@ -1,7 +1,6 @@
 # syncd
 
-Two-way folder sync between two machines over Hyperswarm, using a Hyperdrive
-per machine as the replicated store.
+Two-way folder sync between two machines with no servers, just P2P. How cool is that?
 
 ## Usage
 
